@@ -9,7 +9,12 @@ import type {
 } from 'claude-code';
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import {
+  buildJevRequest,
+  DEFAULT_MODEL,
+  parseJevResponse,
+  SYSTEM_ONE_URL,
+} from '../src/request.js';
 import type {
   CompactOptions,
   CompactResult,
@@ -42,6 +47,7 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 
 export type HookConfig = CompactOptions & {
   apiKey?: string;
+  baseUrl?: string;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
@@ -88,10 +94,15 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
 }
 
 /** A `JevAsker` over the engine's `$.http.fetch`. */
-export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
+export function jevAsker(
+  fetchFn: HookFetch,
+  apiKey: string,
+  model: string,
+  baseUrl: string = SYSTEM_ONE_URL,
+): JevAsker {
   return {
     async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model }, state, questions);
+      const request = buildJevRequest({ apiKey, model, baseUrl }, state, questions);
       const response = await fetchFn(request.url, {
         method: request.method,
         headers: request.headers,
@@ -168,7 +179,8 @@ export async function compactSession(
   fetchFn: HookFetch,
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  const asker = jevAsker(fetchFn, config.apiKey, config.model, config.baseUrl);
+  const result = await compact(messages, asker, config);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -243,6 +255,23 @@ async function getApiKey(
   return undefined;
 }
 
+/** `TYPESAFE_BASE_URL` from the environment; empty or blank values fall back to the System One endpoint. */
+export async function getBaseUrl($: {
+  env: { get: (name: string) => Promise<string | undefined> };
+}): Promise<string> {
+  const fromEnv = (await $.env.get('TYPESAFE_BASE_URL'))?.trim();
+  return fromEnv || SYSTEM_ONE_URL;
+}
+
+/** `TYPESAFE_MODEL` from the environment; empty or blank values keep the configured model. */
+export async function getModel(
+  $: { env: { get: (name: string) => Promise<string | undefined> } },
+  fallback: string,
+): Promise<string> {
+  const fromEnv = (await $.env.get('TYPESAFE_MODEL'))?.trim();
+  return fromEnv || fallback;
+}
+
 function notify(
   $: {
     ui: {
@@ -262,7 +291,12 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('session.compact', async ($, event, next) => {
     try {
-      const config = { ...configured, apiKey: await getApiKey($, configured) };
+      const config = {
+        ...configured,
+        apiKey: await getApiKey($, configured),
+        baseUrl: await getBaseUrl($),
+        model: await getModel($, configured.model),
+      };
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };

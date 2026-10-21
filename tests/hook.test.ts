@@ -3,11 +3,15 @@ import {
   compactSession,
   decisionLog,
   decisionLogLines,
+  getBaseUrl,
+  getModel,
+  jevAsker,
   resolveHookConfig,
   summarize,
   toSessionMessages,
 } from '../hooks/fast-jev.ts';
 import { applyDecisions, collectToolCalls, decideCall, type Message } from '../src/index.js';
+import { SYSTEM_ONE_URL } from '../src/request.js';
 
 type SessionMessage = Message & { handle?: string };
 
@@ -65,6 +69,38 @@ describe('hook config', () => {
       compactAtPercent: 60,
       minReductionRatio: 0.25,
     });
+  });
+});
+
+describe('base url', () => {
+  const env = (value: string | undefined) => ({ get: async () => value });
+
+  it('reads TYPESAFE_BASE_URL and falls back to the System One endpoint when empty', async () => {
+    expect(await getBaseUrl({ env: env(undefined) })).toBe(SYSTEM_ONE_URL);
+    expect(await getBaseUrl({ env: env('') })).toBe(SYSTEM_ONE_URL);
+    expect(await getBaseUrl({ env: env('   ') })).toBe(SYSTEM_ONE_URL);
+    expect(await getBaseUrl({ env: env(' https://example.test/v1 ') })).toBe('https://example.test/v1');
+  });
+
+  it('reads TYPESAFE_MODEL and keeps the configured model when empty', async () => {
+    expect(await getModel({ env: env(undefined) }, 'jev-latest')).toBe('jev-latest');
+    expect(await getModel({ env: env('  ') }, 'jev-latest')).toBe('jev-latest');
+    expect(await getModel({ env: env(' jev-x ') }, 'jev-latest')).toBe('jev-x');
+  });
+
+  it('sends the configured url to fetch', async () => {
+    const urls: string[] = [];
+    const asker = jevAsker(
+      async (url) => {
+        urls.push(url);
+        return { status: 200, ok: true, text: '{"answers":{}}' };
+      },
+      'k',
+      'jev-latest',
+      'https://example.test/v1',
+    );
+    await asker.ask('state', {});
+    expect(urls).toEqual(['https://example.test/v1']);
   });
 });
 
