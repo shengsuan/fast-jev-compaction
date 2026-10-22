@@ -56,14 +56,17 @@ The plugin declares these `userConfig` values in
 | `maxRequestTokens` | `30000` |
 | `truncateHeadChars` | `300` |
 | `model` | `jev-latest` |
+| `baseUrl` | `https://api.typesafe.ai/v1/systemone` |
 
 The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
 through `TYPESAFE_API_KEY`. The environment variable is the recommended
-development setup.
+development setup. The base URL can likewise be set as the `baseUrl` plugin
+option, which takes precedence over `TYPESAFE_BASE_URL`; when neither is set
+the System One endpoint above is used.
 
-Every option except `apiKey`, `compactAtPercent`, `minReductionRatio` and
-`model` is passed straight to the library; see the root README for what they
-do. The `session.compact` hook runs the Jev requests concurrently. If Jev fails,
+Every option except `apiKey`, `baseUrl`, `compactAtPercent`, `minReductionRatio`
+and `model` is passed straight to the library; see the root README for what
+they do. The `session.compact` hook runs the Jev requests concurrently. If Jev fails,
 the response is malformed, the key is unavailable, the history cannot be
 fitted into the state budget, or the estimated reduction is below
 `minReductionRatio`, the hook logs a fallback and delegates to Claude Code's

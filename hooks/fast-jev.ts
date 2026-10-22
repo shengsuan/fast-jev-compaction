@@ -88,6 +88,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   };
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
+  const baseUrl = optionString(options, 'baseUrl')?.trim();
+  if (baseUrl) config.baseUrl = baseUrl;
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
   return config;
@@ -255,10 +257,16 @@ async function getApiKey(
   return undefined;
 }
 
-/** `TYPESAFE_BASE_URL` from the environment; empty or blank values fall back to the System One endpoint. */
-export async function getBaseUrl($: {
-  env: { get: (name: string) => Promise<string | undefined> };
-}): Promise<string> {
+/**
+ * The configured base URL; when it is unset or blank, `TYPESAFE_BASE_URL` from
+ * the environment, then the System One endpoint.
+ */
+export async function getBaseUrl(
+  $: { env: { get: (name: string) => Promise<string | undefined> } },
+  configured?: string,
+): Promise<string> {
+  const fromConfig = configured?.trim();
+  if (fromConfig) return fromConfig;
   const fromEnv = (await $.env.get('TYPESAFE_BASE_URL'))?.trim();
   return fromEnv || SYSTEM_ONE_URL;
 }
@@ -294,7 +302,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const config = {
         ...configured,
         apiKey: await getApiKey($, configured),
-        baseUrl: await getBaseUrl($),
+        baseUrl: await getBaseUrl($, configured.baseUrl),
         model: await getModel($, configured.model),
       };
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {

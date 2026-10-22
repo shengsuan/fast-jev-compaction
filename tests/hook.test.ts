@@ -69,6 +69,14 @@ describe('hook config', () => {
       compactAtPercent: 60,
       minReductionRatio: 0.25,
     });
+    expect(resolveHookConfig({ baseUrl: ' https://example.test/v1 ' }).baseUrl).toBe(
+      'https://example.test/v1',
+    );
+    expect(resolveHookConfig({ baseUrl: '   ' })).toEqual({
+      compactAtPercent: 60,
+      minReductionRatio: 0.25,
+      model: 'jev-latest',
+    });
   });
 });
 
@@ -80,6 +88,16 @@ describe('base url', () => {
     expect(await getBaseUrl({ env: env('') })).toBe(SYSTEM_ONE_URL);
     expect(await getBaseUrl({ env: env('   ') })).toBe(SYSTEM_ONE_URL);
     expect(await getBaseUrl({ env: env(' https://example.test/v1 ') })).toBe('https://example.test/v1');
+  });
+
+  it('prefers the configured base URL over the environment, falling back when blank', async () => {
+    expect(await getBaseUrl({ env: env('https://env.test/v1') }, 'https://option.test/v1')).toBe(
+      'https://option.test/v1',
+    );
+    expect(await getBaseUrl({ env: env('https://env.test/v1') }, '   ')).toBe(
+      'https://env.test/v1',
+    );
+    expect(await getBaseUrl({ env: env(undefined) }, '')).toBe(SYSTEM_ONE_URL);
   });
 
   it('reads TYPESAFE_MODEL and keeps the configured model when empty', async () => {
