@@ -57,6 +57,11 @@
       "description": "Characters of a tool result kept when Jev decides its full output is no longer needed; 0 keeps only the note.",
       "default": 300
     },
+    "testDeleteThreshold": {
+      "type": "number",
+      "title": "Test delete threshold",
+      "description": "After compaction, unit tests whose Jev keep probability is below this are deleted; 0 disables test pruning. Leave unset to use TYPESAFE_TEST_DELETE_THRESHOLD from the environment or the env field of settings.json (default 0.1)."
+    },
     "model": {
       "type": "string",
       "title": "Jev model",

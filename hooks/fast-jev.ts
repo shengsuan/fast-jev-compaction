@@ -10,6 +10,12 @@ import type {
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
 import {
+  DEFAULT_TEST_DELETE_THRESHOLD,
+  pruneTests,
+  type PruneTestsResult,
+  type TestFileAccess,
+} from '../src/tests.js';
+import {
   buildJevRequest,
   DEFAULT_MODEL,
   parseJevResponse,
@@ -51,6 +57,7 @@ export type HookConfig = CompactOptions & {
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
+  testDeleteThreshold?: number;
 };
 
 function optionNumber(options: PluginOptions, key: string, fallback: number): number {
@@ -86,6 +93,10 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
   };
+  const testDeleteThreshold = options['testDeleteThreshold'];
+  if (typeof testDeleteThreshold === 'number' && Number.isFinite(testDeleteThreshold)) {
+    config.testDeleteThreshold = testDeleteThreshold;
+  }
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
   const baseUrl = optionString(options, 'baseUrl')?.trim();
@@ -238,23 +249,34 @@ export function decisionLogLines(
   );
 }
 
-async function getApiKey(
-  $: {
-    env: { get: (name: string) => Promise<string | undefined> };
-    settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
-  },
-  config: HookConfig,
-): Promise<string | undefined> {
-  if (config.apiKey) return config.apiKey;
-  const fromEnv = await $.env.get('TYPESAFE_API_KEY');
+type EnvContext = {
+  env: { get: (name: string) => Promise<string | undefined> };
+  settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
+};
+
+async function readEnv($: EnvContext, name: string): Promise<string | undefined> {
+  const fromEnv = (await $.env.get(name))?.trim();
   if (fromEnv) return fromEnv;
   const settings = await $.settings.read();
   const env = settings['env'];
   if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
-    if (typeof value === 'string' && value) return value;
+    const value = (env as Record<string, unknown>)[name];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
   }
   return undefined;
+}
+
+async function getApiKey($: EnvContext, config: HookConfig): Promise<string | undefined> {
+  if (config.apiKey) return config.apiKey;
+  return readEnv($, 'TYPESAFE_API_KEY');
+}
+
+export async function getTestDeleteThreshold($: EnvContext, configured?: number): Promise<number> {
+  if (configured !== undefined) return configured;
+  const raw = await readEnv($, 'TYPESAFE_TEST_DELETE_THRESHOLD');
+  const value = raw === undefined ? Number.NaN : Number(raw);
+  return Number.isFinite(value) ? value : DEFAULT_TEST_DELETE_THRESHOLD;
 }
 
 /**
@@ -278,6 +300,41 @@ export async function getModel(
 ): Promise<string> {
   const fromEnv = (await $.env.get('TYPESAFE_MODEL'))?.trim();
   return fromEnv || fallback;
+}
+
+export function testPruneSummary(result: PruneTestsResult): string {
+  const names = result.deleted.map((d) => `${d.file}:${d.name}(${d.keepTest.toFixed(2)})`);
+  return `test pruning: ${result.deleted.length}/${result.tests} tests deleted in ${result.files} file(s), ${result.requests} request(s)${
+    names.length > 0 ? `; ${names.join(' ')}` : ''
+  }`;
+}
+
+type FsContext = {
+  fs: {
+    read: (path: string) => Promise<string>;
+    write: (path: string, text: string) => Promise<void>;
+  };
+  process: {
+    run: (argv: readonly string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+  };
+};
+
+export function testFileAccess($: FsContext): TestFileAccess {
+  return {
+    async list() {
+      const { exitCode, stdout, stderr } = await $.process.run([
+        'git',
+        'ls-files',
+        '--cached',
+        '--others',
+        '--exclude-standard',
+      ]);
+      if (exitCode !== 0) throw new Error(`git ls-files failed: ${stderr.slice(0, 200)}`);
+      return stdout.split('\n').filter(Boolean);
+    },
+    read: (path) => $.fs.read(path),
+    write: (path, text) => $.fs.write(path, text),
+  };
 }
 
 function notify(
@@ -331,6 +388,41 @@ export const register: Register = (on: On, options: PluginOptions) => {
     }
   });
 
+  async function pruneRepositoryTests(
+    $: EnvContext &
+      FsContext & {
+        http: { fetch: (url: string, init?: HookFetchInit) => Promise<HookFetchResponse> };
+        ui: Parameters<typeof notify>[0]['ui'];
+      },
+    base: HookConfig,
+  ): Promise<void> {
+    try {
+      const threshold = await getTestDeleteThreshold($, base.testDeleteThreshold);
+      if (threshold <= 0) return;
+      const apiKey = await getApiKey($, base);
+      if (!apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
+      const asker = jevAsker(
+        async (url, init) => {
+          const response = await $.http.fetch(url, init);
+          return { status: response.status, ok: response.ok, text: response.text };
+        },
+        apiKey,
+        await getModel($, base.model),
+        await getBaseUrl($, base.baseUrl),
+      );
+      const options: Parameters<typeof pruneTests>[2] = {
+        deleteThreshold: threshold,
+      };
+      if (base.goal) options.goal = base.goal;
+      if (base.maxRequestTokens !== undefined) options.maxRequestTokens = base.maxRequestTokens;
+      notify($, testPruneSummary(await pruneTests(testFileAccess($), asker, options)));
+    } catch (error) {
+      $.ui.log(
+        `test pruning skipped (${error instanceof Error ? error.message : String(error)})`,
+      );
+    }
+  }
+
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
     if (compacting) return next(event);
     try {
@@ -338,6 +430,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
       compacting = true;
       await $.session.compact();
+      await pruneRepositoryTests($, configured);
     } catch (error) {
       $.ui.log(
         `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`,

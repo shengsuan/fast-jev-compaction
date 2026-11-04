@@ -201,3 +201,19 @@ describe('compactSession', () => {
     ).rejects.toThrow(/500/);
   });
 });
+
+describe('test delete threshold', () => {
+  const ctx = (env: Record<string, string>, settingsEnv: Record<string, unknown>) => ({
+    env: { get: async (name: string) => env[name] },
+    settings: { read: async () => ({ env: settingsEnv }) },
+  });
+
+  it('prefers the option, then the environment, then settings.json env', async () => {
+    const { getTestDeleteThreshold } = await import('../hooks/fast-jev.ts');
+    expect(await getTestDeleteThreshold(ctx({}, {}), 0.3)).toBe(0.3);
+    expect(await getTestDeleteThreshold(ctx({ TYPESAFE_TEST_DELETE_THRESHOLD: '0.2' }, {}))).toBe(0.2);
+    expect(await getTestDeleteThreshold(ctx({}, { TYPESAFE_TEST_DELETE_THRESHOLD: '0.4' }))).toBe(0.4);
+    expect(await getTestDeleteThreshold(ctx({}, { TYPESAFE_TEST_DELETE_THRESHOLD: 'x' }))).toBe(0.1);
+    expect(await getTestDeleteThreshold(ctx({}, {}))).toBe(0.1);
+  });
+});
