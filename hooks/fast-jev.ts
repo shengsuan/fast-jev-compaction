@@ -30,6 +30,9 @@ import type {
   ToolUse,
 } from '../src/types.js';
 
+/** The slash command that runs test pruning on demand: `/prune-tests`. */
+export const PRUNE_TESTS_COMMAND = 'prune-tests';
+
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
   minReductionRatio: 0.25,
@@ -388,40 +391,71 @@ export const register: Register = (on: On, options: PluginOptions) => {
     }
   });
 
-  async function pruneRepositoryTests(
-    $: EnvContext &
-      FsContext & {
-        http: { fetch: (url: string, init?: HookFetchInit) => Promise<HookFetchResponse> };
-        ui: Parameters<typeof notify>[0]['ui'];
-      },
+  type PruneContext = EnvContext &
+    FsContext & {
+      http: { fetch: (url: string, init?: HookFetchInit) => Promise<HookFetchResponse> };
+      ui: Parameters<typeof notify>[0]['ui'];
+    };
+
+  /**
+   * Runs test pruning over the repository. Resolves to `undefined` when the
+   * threshold disables it; throws when the key is missing or Jev fails.
+   */
+  async function runTestPrune(
+    $: PruneContext,
     base: HookConfig,
-  ): Promise<void> {
+  ): Promise<PruneTestsResult | undefined> {
+    const threshold = await getTestDeleteThreshold($, base.testDeleteThreshold);
+    if (threshold <= 0) return undefined;
+    const apiKey = await getApiKey($, base);
+    if (!apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
+    const asker = jevAsker(
+      async (url, init) => {
+        const response = await $.http.fetch(url, init);
+        return { status: response.status, ok: response.ok, text: response.text };
+      },
+      apiKey,
+      await getModel($, base.model),
+      await getBaseUrl($, base.baseUrl),
+    );
+    const options: Parameters<typeof pruneTests>[2] = {
+      deleteThreshold: threshold,
+    };
+    if (base.goal) options.goal = base.goal;
+    if (base.maxRequestTokens !== undefined) options.maxRequestTokens = base.maxRequestTokens;
+    return pruneTests(testFileAccess($), asker, options);
+  }
+
+  async function pruneRepositoryTests($: PruneContext, base: HookConfig): Promise<void> {
     try {
-      const threshold = await getTestDeleteThreshold($, base.testDeleteThreshold);
-      if (threshold <= 0) return;
-      const apiKey = await getApiKey($, base);
-      if (!apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-      const asker = jevAsker(
-        async (url, init) => {
-          const response = await $.http.fetch(url, init);
-          return { status: response.status, ok: response.ok, text: response.text };
-        },
-        apiKey,
-        await getModel($, base.model),
-        await getBaseUrl($, base.baseUrl),
-      );
-      const options: Parameters<typeof pruneTests>[2] = {
-        deleteThreshold: threshold,
-      };
-      if (base.goal) options.goal = base.goal;
-      if (base.maxRequestTokens !== undefined) options.maxRequestTokens = base.maxRequestTokens;
-      notify($, testPruneSummary(await pruneTests(testFileAccess($), asker, options)));
+      const result = await runTestPrune($, base);
+      if (result) notify($, testPruneSummary(result));
     } catch (error) {
       $.ui.log(
         `test pruning skipped (${error instanceof Error ? error.message : String(error)})`,
       );
     }
   }
+
+  on('session.start', async ($, event, next) => {
+    await $.command.register({
+      name: PRUNE_TESTS_COMMAND,
+      description: 'Delete unit tests that Jev judges no longer worth keeping.',
+    });
+    return next(event);
+  });
+
+  on('command.run', { command: PRUNE_TESTS_COMMAND }, async ($) => {
+    try {
+      const result = await runTestPrune($, configured);
+      if (!result) return { text: 'test pruning disabled (testDeleteThreshold is 0)' };
+      return { text: testPruneSummary(result) };
+    } catch (error) {
+      return {
+        text: `test pruning failed (${error instanceof Error ? error.message : String(error)})`,
+      };
+    }
+  });
 
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
     if (compacting) return next(event);

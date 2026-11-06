@@ -77,6 +77,12 @@ reduction, per-reason counts, state size and request count; a per-call
 compaction when `context.percent` reaches `compactAtPercent`, with an
 in-flight guard.
 
+Test pruning also runs on demand. The hook registers the `/prune-tests` slash
+command at session start, and running it prunes the repository's unit tests
+with the same `testDeleteThreshold` and Jev call as the automatic pass after
+compaction. The command replies with the pruning summary, or with the reason
+it was skipped or failed.
+
 ## Scope and caveat
 
 Function hooks are early access and may change between Claude Code releases.

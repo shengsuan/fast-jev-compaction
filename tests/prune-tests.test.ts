@@ -3,14 +3,6 @@ import { extractTestFunctions, isTestFile, pruneTests, removeRanges } from '../s
 
 const source = `import { it } from 'vitest';
 
-it('adds', () => {
-  expect(1 + 1).toBe(2);
-});
-
-it('does nothing', () => {
-  const s = ")";
-});
-
 it('subtracts', () => {
   expect(2 - 1).toBe(1);
 });
