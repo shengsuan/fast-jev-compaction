@@ -62,7 +62,7 @@ interface Syntax {
   charQuote: boolean;
 }
 
-const IGNORED_DIRECTORY =
+export const IGNORED_DIRECTORY =
   /(^|\/)(node_modules|dist|build|target|out|bin|obj|vendor|third_party|Pods|\.git|\.gradle|\.build|\.dart_tool|\.next|_build|deps|coverage|__pycache__|venv|\.venv|site-packages)\//;
 
 const C_SYNTAX: Syntax = { slashComments: true, hashComments: false, charQuote: false };
@@ -70,7 +70,7 @@ const CHAR_SYNTAX: Syntax = { slashComments: true, hashComments: false, charQuot
 const PHP_SYNTAX: Syntax = { slashComments: true, hashComments: true, charQuote: false };
 const HASH_SYNTAX: Syntax = { slashComments: false, hashComments: true, charQuote: false };
 
-const CHAR_LITERAL = /^'(?:\\[^']*|[^\\'\n])'/;
+export const CHAR_LITERAL = /^'(?:\\[^']*|[^\\'\n])'/;
 
 function lineStarts(text: string): number[] {
   const starts = [0];

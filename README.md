@@ -163,6 +163,30 @@ To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 
 from the repository root. No publishing step is required; the marketplace is
 just the repo's `.claude-plugin/marketplace.json`.
 
+### Slash commands
+
+Both commands run on demand inside a session. They use the same TypeSafe key
+and model settings as compaction, and they change files in the working tree
+directly, so commit or stash first.
+
+- `/prune-tests` deletes unit tests that Jev judges as protecting nothing
+  (empty, trivially asserting, tautological, mock-only). It scans every test
+  file in the repository, as listed by `git ls-files`. It is also run
+  automatically after compaction. The threshold comes from
+  `testDeleteThreshold`, and `0` disables it.
+- `/prune-comments [diff|all]` deletes comments that Jev judges as restating
+  the code, decorative, or history-only.
+  - `diff` (the default) judges only comment blocks that overlap lines added
+    relative to `HEAD`, staged or not. Untracked files count as fully added.
+  - `all` judges every comment in the repository.
+
+  Only full-line comments are judged. Trailing comments, comments inside string
+  literals, and pragma, licence and shebang comments are always kept. Blocks
+  scoring below 0.3 are deleted. Unknown arguments return a usage message.
+
+Both commands reply with a summary: the number deleted, the files and requests
+involved, and the deleted items with their Jev scores.
+
 ## Development
 
 ```sh

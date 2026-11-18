@@ -1,4 +1,5 @@
 import type {
+  CommandRunInput,
   On,
   PluginOptions,
   Register,
@@ -9,6 +10,12 @@ import type {
 } from 'claude-code';
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
+import {
+  DEFAULT_COMMENT_DELETE_THRESHOLD,
+  parseAddedLines,
+  pruneComments,
+  type PruneCommentsResult,
+} from '../src/comments.js';
 import {
   DEFAULT_TEST_DELETE_THRESHOLD,
   pruneTests,
@@ -32,6 +39,9 @@ import type {
 
 /** The slash command that runs test pruning on demand: `/prune-tests`. */
 export const PRUNE_TESTS_COMMAND = 'prune-tests';
+
+/** The slash command that removes low-value comments: `/prune-comments [diff|all]`. */
+export const PRUNE_COMMENTS_COMMAND = 'prune-comments';
 
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
@@ -376,15 +386,10 @@ type PruneContext = EnvContext &
  * Runs test pruning over the repository. Resolves to `undefined` when the
  * threshold disables it; throws when the key is missing or Jev fails.
  */
-async function runTestPrune(
-  $: PruneContext,
-  base: HookConfig,
-): Promise<PruneTestsResult | undefined> {
-  const threshold = await getTestDeleteThreshold($, base.testDeleteThreshold);
-  if (threshold <= 0) return undefined;
+async function pruneAsker($: PruneContext, base: HookConfig): Promise<JevAsker> {
   const apiKey = await getApiKey($, base);
   if (!apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const asker = jevAsker(
+  return jevAsker(
     async (url, init) => {
       const response = await $.http.fetch(url, init);
       return { status: response.status, ok: response.ok, text: response.text };
@@ -393,6 +398,15 @@ async function runTestPrune(
     await getModel($, base.model),
     await getBaseUrl($, base.baseUrl),
   );
+}
+
+async function runTestPrune(
+  $: PruneContext,
+  base: HookConfig,
+): Promise<PruneTestsResult | undefined> {
+  const threshold = await getTestDeleteThreshold($, base.testDeleteThreshold);
+  if (threshold <= 0) return undefined;
+  const asker = await pruneAsker($, base);
   const options: Parameters<typeof pruneTests>[2] = {
     deleteThreshold: threshold,
   };
@@ -410,6 +424,54 @@ async function pruneRepositoryTests($: PruneContext, base: HookConfig): Promise<
       `test pruning skipped (${error instanceof Error ? error.message : String(error)})`,
     );
   }
+}
+
+export type CommentScope = 'diff' | 'all';
+
+export function parseCommentScope(args: string): CommentScope | undefined {
+  const scope = args.trim().toLowerCase();
+  if (scope === '' || scope === 'diff') return 'diff';
+  if (scope === 'all') return 'all';
+  return undefined;
+}
+
+/**
+ * Lines added in the working tree relative to HEAD, staged or not, plus every
+ * untracked file (all of whose lines are new). Deleted files contribute nothing.
+ */
+async function changedLines($: Pick<FsContext, 'process'>): Promise<Map<string, Set<number> | true>> {
+  const diff = await $.process.run(['git', 'diff', '--unified=0', 'HEAD', '--']);
+  if (diff.exitCode !== 0) throw new Error(`git diff failed: ${diff.stderr.slice(0, 200)}`);
+  const lines: Map<string, Set<number> | true> = new Map(parseAddedLines(diff.stdout));
+  const untracked = await $.process.run(['git', 'ls-files', '--others', '--exclude-standard']);
+  if (untracked.exitCode !== 0) {
+    throw new Error(`git ls-files failed: ${untracked.stderr.slice(0, 200)}`);
+  }
+  for (const file of untracked.stdout.split('\n').filter(Boolean)) lines.set(file, true);
+  return lines;
+}
+
+export function commentPruneSummary(result: PruneCommentsResult, scope: CommentScope): string {
+  const names = result.deleted.map((d) => `${d.file}:${d.startLine}(${d.keepComment.toFixed(2)})`);
+  return `comment pruning (${scope}): ${result.deleted.length}/${result.comments} comment blocks deleted in ${result.files} file(s), ${result.requests} request(s)${
+    names.length > 0 ? `; ${names.join(' ')}` : ''
+  }`;
+}
+
+async function runCommentPrune(
+  $: PruneContext,
+  base: HookConfig,
+  scope: CommentScope,
+): Promise<PruneCommentsResult> {
+  const asker = await pruneAsker($, base);
+  const addedLines = scope === 'diff' ? await changedLines($) : undefined;
+  const options: Parameters<typeof pruneComments>[2] = {
+    deleteThreshold: DEFAULT_COMMENT_DELETE_THRESHOLD,
+  };
+  if (addedLines) options.addedLines = addedLines;
+  if (base.goal) options.goal = base.goal;
+  if (base.maxRequestTokens !== undefined) options.maxRequestTokens = base.maxRequestTokens;
+  return pruneComments(testFileAccess($), asker, options);
 }
 
 export const register: Register = (on: On, options: PluginOptions) => {
@@ -455,7 +517,25 @@ export const register: Register = (on: On, options: PluginOptions) => {
       name: PRUNE_TESTS_COMMAND,
       description: 'Delete unit tests that Jev judges no longer worth keeping.',
     });
+    await $.command.register({
+      name: PRUNE_COMMENTS_COMMAND,
+      description: 'Delete low-value comments; scope is diff (default) or all.',
+      argumentHint: '[diff|all]',
+    });
     return next(event);
+  });
+
+  on('command.run', { command: PRUNE_COMMENTS_COMMAND }, async ($, event: CommandRunInput) => {
+    const scope = parseCommentScope(event.args);
+    if (!scope) return { text: 'usage: /prune-comments [diff|all]' };
+    try {
+      const result = await runCommentPrune($, configured, scope);
+      return { text: commentPruneSummary(result, scope) };
+    } catch (error) {
+      return {
+        text: `comment pruning failed (${error instanceof Error ? error.message : String(error)})`,
+      };
+    }
   });
 
   on('command.run', { command: PRUNE_TESTS_COMMAND }, async ($) => {

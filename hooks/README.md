@@ -83,6 +83,15 @@ with the same `testDeleteThreshold` and Jev call as the automatic pass after
 compaction. The command replies with the pruning summary, or with the reason
 it was skipped or failed.
 
+Comment pruning runs on demand through `/prune-comments [diff|all]`. The
+default `diff` scope judges only comment blocks that overlap lines added
+relative to `HEAD`, staged or not, plus every line of untracked files. `all`
+judges every comment in the repository. Full-line comments are found by file
+extension for the common languages; trailing comments, comments inside string
+literals, and pragma, licence and shebang comments are never judged. Jev
+scores each block with a keep question, and blocks below 0.1 are deleted. The
+reply gives the count, the files and the deleted line ranges.
+
 ## Scope and caveat
 
 Function hooks are early access and may change between Claude Code releases.
