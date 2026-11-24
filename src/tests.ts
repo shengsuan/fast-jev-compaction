@@ -97,6 +97,7 @@ export interface PruneTestsResult {
   scores: Array<{ id: string; file: string; name: string; keepTest: number }>;
   skipped: TestSkip[];
   errors: string[];
+  removedFiles: string[];
   verifyRuns: number;
 }
 
@@ -106,6 +107,7 @@ export interface TestFileAccess {
   list(): Promise<string[]>;
   read(path: string): Promise<string>;
   write(path: string, text: string): Promise<void>;
+  remove?(path: string): Promise<void>;
   verify?(paths: string[]): Promise<VerifyOutcome>;
 }
 
@@ -118,6 +120,7 @@ export interface PruneTestsOptions {
   retries?: number;
   maxVerifyRuns?: number;
   keepAtLeastOnePerFile?: boolean;
+  removeEmptyFiles?: boolean;
   signal?: AbortSignal;
 }
 
@@ -130,7 +133,9 @@ interface Language {
   syntax: Syntax;
   strict: boolean;
   extract: Extractor;
-  finish?: (text: string) => string;
+  finish?: (text: string, original: string) => string;
+  prune?: (source: Source, removed: readonly Range[]) => Range[];
+  emptyFileFails?: boolean;
 }
 
 export const IGNORED_DIRECTORY =
@@ -573,12 +578,124 @@ function fillEmptyBlocks(text: string): string {
   return out.join(newline);
 }
 
+const DESCRIBE_HEAD =
+  /^([ \t]*)(?:describe|suite)(?:\.(?:only|skip|concurrent|sequential|todo))*[ \t]*\(/gm;
+const TEST_TOKEN =
+  /(?<![\w$.])(?:Deno\s*\.\s*)?(?:it|test|specify|bench|describe|suite)\b(?:\s*\.\s*[A-Za-z]+)*\s*[(`]/g;
+
+function hasTestTokens(source: Source, from: number, to: number, ignore: readonly Range[]): boolean {
+  const pattern = new RegExp(TEST_TOKEN.source, 'g');
+  pattern.lastIndex = from;
+  for (
+    let match = pattern.exec(source.text);
+    match !== null && match.index < to;
+    match = pattern.exec(source.text)
+  ) {
+    const at = match.index;
+    if (source.mask[at] !== 0) continue;
+    if (ignore.some((range) => at >= range.start && at < range.end)) continue;
+    return true;
+  }
+  return false;
+}
+
+function emptiedDescribes(source: Source, doomed: readonly Range[]): Range[] {
+  const blocks: Array<Range & { open: number; close: number }> = [];
+  for (const match of source.text.matchAll(DESCRIBE_HEAD)) {
+    const start = match.index!;
+    const indent = match[1]!.length;
+    if (source.mask[start + indent] !== 0 || !startsStatement(source, start + indent)) continue;
+    const open = start + match[0].length - 1;
+    const close = matchingClose(source, open);
+    if (close === -1) continue;
+    const end = statementEnd(source, close + 1, true, true);
+    if (end === -1) continue;
+    blocks.push({ start, end, open, close });
+  }
+  blocks.sort((a, b) => a.end - a.start - (b.end - b.start));
+  const removed: Range[] = doomed.map((range) => ({ start: range.start, end: range.end }));
+  const pruned: Range[] = [];
+  for (const block of blocks) {
+    const inside = removed.filter((range) => range.start >= block.open && range.end <= block.close + 1);
+    if (inside.length === 0 || hasTestTokens(source, block.open + 1, block.close, inside)) continue;
+    pruned.push({ start: block.start, end: block.end });
+    removed.push({ start: block.start, end: block.end });
+  }
+  return pruned;
+}
+
+const GO_IMPORT_SPEC = /^[ \t]*(?:([A-Za-z_]\w*|\.)[ \t]+)?"([^"\n]+)"[ \t]*(?:\/\/.*)?$/;
+const GO_IMPORT_SINGLE = /^import[ \t]+(?:([A-Za-z_]\w*|\.)[ \t]+)?"([^"\n]+)"[ \t]*(?:\/\/.*)?$/;
+
+function goImportName(alias: string | undefined, path: string): string | undefined {
+  if (alias !== undefined) return alias === '_' || alias === '.' ? undefined : alias;
+  const parts = path.split('/');
+  let name = parts[parts.length - 1]!;
+  if (/^v\d+$/.test(name) && parts.length > 1) name = parts[parts.length - 2]!;
+  return /^[A-Za-z_]\w*$/.test(name) ? name : undefined;
+}
+
+function selectorCount(source: Source, name: string): number {
+  const pattern = new RegExp(`(?<![\\w.])${name}\\s*\\.`, 'g');
+  let count = 0;
+  for (const match of source.text.matchAll(pattern)) {
+    if (source.mask[match.index!] === 0) count += 1;
+  }
+  return count;
+}
+
+function pruneUnusedGoImports(text: string, original: string): string {
+  const after = createSource(text, GO_SYNTAX);
+  const before = createSource(original, GO_SYNTAX);
+  const starts = lineStarts(text);
+  const lines = text.split('\n').map((line) => line.replace(/\r$/, ''));
+  const unused = (alias: string | undefined, path: string): boolean => {
+    const name = goImportName(alias, path);
+    if (name === undefined) return false;
+    return selectorCount(before, name) > 0 && selectorCount(after, name) === 0;
+  };
+  const lineRange = (index: number): Range => ({
+    start: starts[index]!,
+    end: starts[index]! + lines[index]!.length,
+  });
+  const ranges: Range[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!;
+    if (after.mask[starts[i]!] !== 0) continue;
+    if (/^import[ \t]*\([ \t]*$/.test(line)) {
+      const specs: Array<{ line: number; remove: boolean }> = [];
+      let j = i + 1;
+      for (; j < lines.length && lines[j]!.trim() !== ')'; j += 1) {
+        const trimmed = lines[j]!.trim();
+        const match = GO_IMPORT_SPEC.exec(lines[j]!);
+        if (match) specs.push({ line: j, remove: unused(match[1], match[2]!) });
+        else if (trimmed !== '' && !trimmed.startsWith('//')) specs.push({ line: j, remove: false });
+      }
+      if (j >= lines.length) break;
+      if (specs.some((spec) => spec.remove)) {
+        if (specs.every((spec) => spec.remove)) {
+          ranges.push({ start: starts[i]!, end: lineRange(j).end });
+        } else {
+          for (const spec of specs) if (spec.remove) ranges.push(lineRange(spec.line));
+        }
+      }
+      i = j;
+      continue;
+    }
+    const single = GO_IMPORT_SINGLE.exec(line);
+    if (single && unused(single[1], single[2]!)) ranges.push(lineRange(i));
+  }
+  return ranges.length > 0 ? removeRanges(text, ranges) : text;
+}
+
 const LANGUAGES: Language[] = [
   {
     files: /(^|\/)[^/]+[._](test|spec)\.[cm]?[jt]sx?$|(^|\/)__tests__\/[^/]+\.[cm]?[jt]sx?$/,
     syntax: JS_SYNTAX,
     strict: true,
     extract: calls('it|test|specify|Deno\\.test'),
+    prune: emptiedDescribes,
+    emptyFileFails: true,
   },
   {
     files: /(^|\/)(test_[^/]+|[^/]+_test)\.py$/,
@@ -591,7 +708,8 @@ const LANGUAGES: Language[] = [
     files: /_test\.go$/,
     syntax: GO_SYNTAX,
     strict: true,
-    extract: braced(/^func\s+(Test\w*)\b/),
+    extract: braced(/^func\s+(Test(?![a-z])\w*)\s*\(\s*(?:\w+\s+)?\*testing\.T\s*\)/),
+    finish: pruneUnusedGoImports,
   },
   {
     files: /\.rs$/,
@@ -793,21 +911,20 @@ interface Range {
 }
 
 function mergeRanges(ranges: readonly Range[]): Range[] {
-  const sorted = ranges
+  const ascending = ranges
     .filter((range) => range.end > range.start)
     .map((range) => ({ start: range.start, end: range.end }))
-    .sort((a, b) => b.start - a.start || b.end - a.end);
+    .sort((a, b) => a.start - b.start || b.end - a.end);
   const merged: Range[] = [];
-  for (const range of sorted) {
+  for (const range of ascending) {
     const last = merged[merged.length - 1];
-    if (last && range.end > last.start) {
-      last.start = Math.min(last.start, range.start);
+    if (last && range.start < last.end) {
       last.end = Math.max(last.end, range.end);
     } else {
       merged.push(range);
     }
   }
-  return merged;
+  return merged.reverse();
 }
 
 function blankLineEnd(text: string, at: number): number {
@@ -873,6 +990,12 @@ interface FilePlan {
   all: TestFunction[];
   removed: TestFunction[];
   text: string;
+  empty: boolean;
+}
+
+interface Edit {
+  text: string;
+  empty: boolean;
 }
 
 function planEdit(
@@ -881,17 +1004,19 @@ function planEdit(
   original: string,
   all: readonly TestFunction[],
   removed: readonly TestFunction[],
-): string | undefined {
+): Edit | undefined {
   const doomed = new Set(removed.map((test) => test.id));
-  let text = removeRanges(original, removed);
-  if (language.finish) text = language.finish(text);
+  const extra = language.prune ? language.prune(createSource(original, language.syntax), removed) : [];
+  let text = removeRanges(original, [...removed, ...extra]);
+  if (language.finish) text = language.finish(text, original);
   const source = createSource(text, language.syntax);
   if (language.strict && !isBalanced(text, source.mask)) return undefined;
   const survivors = all.filter((test) => !doomed.has(test.id)).map((test) => test.source);
   const after = extractTestFunctions(path, text).map((test) => test.source);
   if (after.length !== survivors.length) return undefined;
   for (let i = 0; i < after.length; i += 1) if (after[i] !== survivors[i]) return undefined;
-  return text;
+  const empty = language.emptyFileFails === true && !hasTestTokens(source, 0, text.length, []);
+  return { text, empty };
 }
 
 async function mapLimit<T, R>(
@@ -1056,6 +1181,7 @@ export async function pruneTests(
     });
   };
 
+  const removeEmpty = (options.removeEmptyFiles ?? true) && files.remove !== undefined;
   const plans: FilePlan[] = [];
   const doomedByFile = new Map<string, TestFunction[]>();
   for (const { test } of candidates) {
@@ -1079,12 +1205,21 @@ export async function pruneTests(
       continue;
     }
     const all = tests.filter((test) => test.file === path);
-    const text = planEdit(path, language, original, all, removed);
-    if (text === undefined) {
-      for (const test of removed) skip(test, 'mismatch');
+    let kept = removed;
+    let edit = planEdit(path, language, original, all, kept);
+    while (edit && edit.empty && !removeEmpty) {
+      const best = kept.reduce((a, b) => ((scoreOf.get(b.id) ?? 0) > (scoreOf.get(a.id) ?? 0) ? b : a));
+      skip(best, 'last_in_file');
+      kept = kept.filter((test) => test.id !== best.id);
+      if (kept.length === 0) break;
+      edit = planEdit(path, language, original, all, kept);
+    }
+    if (kept.length === 0) continue;
+    if (!edit) {
+      for (const test of kept) skip(test, 'mismatch');
       continue;
     }
-    plans.push({ path, language, original, all, removed, text });
+    plans.push({ path, language, original, all, removed: kept, text: edit.text, empty: edit.empty });
   }
 
   let verifyRuns = 0;
@@ -1106,10 +1241,15 @@ export async function pruneTests(
     }
   };
 
+  const put = async (plan: FilePlan, text: string, empty: boolean): Promise<void> => {
+    if (empty && files.remove) await files.remove(plan.path);
+    else await files.write(plan.path, text);
+  };
+
   let written: FilePlan[] = [];
   for (const plan of plans) {
     try {
-      await files.write(plan.path, plan.text);
+      await put(plan, plan.text, plan.empty);
       written.push(plan);
     } catch (error) {
       errors.push(`${plan.path}: ${describeError(error)}`);
@@ -1126,7 +1266,7 @@ export async function pruneTests(
         for (const test of plan.removed) skip(test, 'verify_failed');
         continue;
       }
-      await files.write(plan.path, plan.text);
+      await put(plan, plan.text, plan.empty);
       if (await check([plan.path])) {
         accepted.push(plan);
         continue;
@@ -1137,18 +1277,18 @@ export async function pruneTests(
         for (const test of plan.removed) {
           if (verifyRuns >= maxVerifyRuns) break;
           const trial = [...kept, test];
-          const trialText = planEdit(plan.path, plan.language, plan.original, plan.all, trial);
-          if (trialText === undefined) continue;
-          await files.write(plan.path, trialText);
+          const trialEdit = planEdit(plan.path, plan.language, plan.original, plan.all, trial);
+          if (trialEdit === undefined || trialEdit.empty) continue;
+          await files.write(plan.path, trialEdit.text);
           if (await check([plan.path])) {
             kept = trial;
-            keptText = trialText;
+            keptText = trialEdit.text;
           }
         }
       }
       if (keptText !== undefined && kept.length > 0) {
         await files.write(plan.path, keptText);
-        accepted.push({ ...plan, removed: kept, text: keptText });
+        accepted.push({ ...plan, removed: kept, text: keptText, empty: false });
         const keptIds = new Set(kept.map((test) => test.id));
         for (const test of plan.removed) if (!keptIds.has(test.id)) skip(test, 'verify_failed');
       } else {
@@ -1181,6 +1321,7 @@ export async function pruneTests(
     scores,
     skipped,
     errors,
+    removedFiles: written.filter((plan) => plan.empty).map((plan) => plan.path),
     verifyRuns,
   };
 }
