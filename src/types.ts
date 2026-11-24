@@ -196,7 +196,11 @@ export interface JevResponse {
   [key: string]: unknown;
 }
 
+export interface JevAskOptions {
+  signal?: AbortSignal;
+}
+
 /** Anything that can answer Jev questions: `JevClient`, or a host-provided adapter. */
 export interface JevAsker {
-  ask(state: JevState, questions: JevQuestions): Promise<JevResponse>;
+  ask(state: JevState, questions: JevQuestions, options?: JevAskOptions): Promise<JevResponse>;
 }
