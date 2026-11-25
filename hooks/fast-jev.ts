@@ -494,6 +494,8 @@ async function runCommentPrune(
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
+  // The host rejects session.compact() inside command.run, so the command only defers it to turn.complete.
+  let compactRequested = false;
 
   on('session.compact', async ($, event, next) => {
     try {
@@ -546,18 +548,10 @@ export const register: Register = (on: On, options: PluginOptions) => {
     return next(event);
   });
 
-  on('command.run', { command: COMPACT_MESSAGES_COMMAND }, async ($) => {
+  on('command.run', { command: COMPACT_MESSAGES_COMMAND }, async () => {
     if (compacting) return { text: 'compaction already in progress' };
-    compacting = true;
-    try {
-      return { text: compactCommandSummary(await $.session.compact()) };
-    } catch (error) {
-      return {
-        text: `compaction failed (${error instanceof Error ? error.message : String(error)})`,
-      };
-    } finally {
-      compacting = false;
-    }
+    compactRequested = true;
+    return { text: 'compaction will run when this turn completes' };
   });
 
   on('command.run', { command: PRUNE_COMMENTS_COMMAND }, async ($, event: CommandRunInput) => {
@@ -587,15 +581,20 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
     if (compacting) return next(event);
+    const requested = compactRequested;
+    compactRequested = false;
     try {
-      const { context } = await $.session.usage();
-      if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
+      if (!requested) {
+        const { context } = await $.session.usage();
+        if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
+      }
       compacting = true;
-      await $.session.compact();
+      const compaction = await $.session.compact();
+      if (requested) notify($, compactCommandSummary(compaction));
       await pruneRepositoryTests($, configured);
     } catch (error) {
       $.ui.log(
-        `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`,
+        `${requested ? 'compaction failed' : 'auto-compact skipped'} (${error instanceof Error ? error.message : String(error)})`,
       );
     } finally {
       compacting = false;

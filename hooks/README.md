@@ -78,10 +78,12 @@ compaction when `context.percent` reaches `compactAtPercent`, with an
 in-flight guard.
 
 Compaction also runs on demand through the `/prune-messages` slash command,
-registered at session start. It calls `$.session.compact()`, so the same
-`session.compact` hook above does the work, with the same fallback to the
-built-in summary. The reply gives the resulting message count and token
-sizes, or the reason the compaction was skipped or failed.
+registered at session start. The host refuses `$.session.compact()` from
+inside `command.run`, so the command only queues a request and replies at once;
+the next `turn.complete` then compacts regardless of `compactAtPercent`, through
+the same `session.compact` hook above and with the same fallback to the
+built-in summary. The outcome (message count and token sizes, or the skip
+reason) is shown as a toast and logged.
 
 Test pruning also runs on demand. The hook registers the `/prune-tests` slash
 command at session start, and running it prunes the repository's unit tests
