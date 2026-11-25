@@ -43,6 +43,9 @@ export const PRUNE_TESTS_COMMAND = 'prune-tests';
 /** The slash command that removes low-value comments: `/prune-comments [diff|all]`. */
 export const PRUNE_COMMENTS_COMMAND = 'prune-comments';
 
+/** The slash command that compacts the conversation on demand: `/compact-messages`. */
+export const COMPACT_MESSAGES_COMMAND = 'prune-messages';
+
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
   minReductionRatio: 0.25,
@@ -426,6 +429,20 @@ async function pruneRepositoryTests($: PruneContext, base: HookConfig): Promise<
   }
 }
 
+export function compactCommandSummary(result: {
+  messages?: readonly unknown[];
+  tokensBefore?: number;
+  tokensAfter?: number;
+  skip?: string;
+}): string {
+  if (result.skip !== undefined) return `compaction skipped (${result.skip})`;
+  const tokens =
+    result.tokensBefore !== undefined && result.tokensAfter !== undefined
+      ? `, ${result.tokensBefore} -> ${result.tokensAfter} tokens`
+      : '';
+  return `compacted to ${result.messages?.length ?? 0} messages${tokens}`;
+}
+
 export type CommentScope = 'diff' | 'all';
 
 export function parseCommentScope(args: string): CommentScope | undefined {
@@ -514,6 +531,10 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('session.start', async ($, event, next) => {
     await $.command.register({
+      name: COMPACT_MESSAGES_COMMAND,
+      description: 'Compact the conversation with Jev, dropping tool calls and results it judges unneeded.',
+    });
+    await $.command.register({
       name: PRUNE_TESTS_COMMAND,
       description: 'Delete unit tests that Jev judges no longer worth keeping.',
     });
@@ -523,6 +544,20 @@ export const register: Register = (on: On, options: PluginOptions) => {
       argumentHint: '[diff|all]',
     });
     return next(event);
+  });
+
+  on('command.run', { command: COMPACT_MESSAGES_COMMAND }, async ($) => {
+    if (compacting) return { text: 'compaction already in progress' };
+    compacting = true;
+    try {
+      return { text: compactCommandSummary(await $.session.compact()) };
+    } catch (error) {
+      return {
+        text: `compaction failed (${error instanceof Error ? error.message : String(error)})`,
+      };
+    } finally {
+      compacting = false;
+    }
   });
 
   on('command.run', { command: PRUNE_COMMENTS_COMMAND }, async ($, event: CommandRunInput) => {

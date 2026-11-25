@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  compactCommandSummary,
   compactSession,
   decisionLog,
   decisionLogLines,
@@ -215,5 +216,21 @@ describe('test delete threshold', () => {
     expect(await getTestDeleteThreshold(ctx({}, { TYPESAFE_TEST_DELETE_THRESHOLD: '0.4' }))).toBe(0.4);
     expect(await getTestDeleteThreshold(ctx({}, { TYPESAFE_TEST_DELETE_THRESHOLD: 'x' }))).toBe(0.1);
     expect(await getTestDeleteThreshold(ctx({}, {}))).toBe(0.1);
+  });
+});
+
+describe('compactCommandSummary', () => {
+  it('reports message count and token sizes', () => {
+    expect(
+      compactCommandSummary({ messages: [{}, {}, {}], tokensBefore: 9000, tokensAfter: 4000 }),
+    ).toBe('compacted to 3 messages, 9000 -> 4000 tokens');
+  });
+
+  it('omits token sizes the engine did not record', () => {
+    expect(compactCommandSummary({ messages: [{}] })).toBe('compacted to 1 messages');
+  });
+
+  it('reports the veto reason when compaction is skipped', () => {
+    expect(compactCommandSummary({ skip: 'off' })).toBe('compaction skipped (off)');
   });
 });
